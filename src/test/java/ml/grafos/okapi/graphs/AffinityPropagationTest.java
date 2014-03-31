@@ -32,8 +32,8 @@ public class AffinityPropagationTest {
     };
 
     GiraphConfiguration conf = new GiraphConfiguration();
-    conf.setComputationClass(AffinityPropagation.class);
-    conf.setMasterComputeClass(AffinityPropagation.MasterComputation.class);
+    conf.setComputationClass(AffinityPropagation.InitialStage.class);
+    conf.setMasterComputeClass(AffinityPropagation.class);
     conf.setVertexInputFormatClass(AffinityPropagation.APInputFormatter.class);
     conf.setInt(AffinityPropagation.MAX_ITERATIONS, 15);
     conf.setFloat(AffinityPropagation.DAMPING, 0.9f);

@@ -24,6 +24,11 @@ import es.csic.iiia.bms.factors.SelectorFactor;
 import es.csic.iiia.bms.factors.WeightingFactor;
 import ml.grafos.okapi.common.data.*;
 import ml.grafos.okapi.common.data.MapWritable;
+import ml.grafos.okapi.multistage.MultistageMasterCompute;
+import ml.grafos.okapi.multistage.Stage;
+import ml.grafos.okapi.multistage.StageComputation;
+import ml.grafos.okapi.multistage.voting.TransitionElection;
+import ml.grafos.okapi.multistage.voting.UnanimityElection;
 import org.apache.giraph.aggregators.BasicAggregator;
 import org.apache.giraph.aggregators.LongMaxAggregator;
 import org.apache.giraph.graph.BasicComputation;
@@ -54,9 +59,7 @@ import java.util.regex.Pattern;
  * @author Marc Pujol-Gonzalez <mpujol@iiia.csic.es>
  * @author Toni Penya-Alba <tonipenya@iiia.csic.es>
  */
-public class AffinityPropagation
-    extends BasicComputation<AffinityPropagation.APVertexID,
-    AffinityPropagation.APVertexValue, NullWritable, AffinityPropagation.APMessage> {
+public class AffinityPropagation extends MultistageMasterCompute {
   private static MaxOperator MAX_OPERATOR = new Maximize();
 
   private static Logger logger = Logger.getLogger(AffinityPropagation.class);
@@ -73,152 +76,230 @@ public class AffinityPropagation
   public static float DAMPING_DEFAULT = 0.9f;
 
   @Override
-  public void compute(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
-                      Iterable<APMessage> messages) throws IOException {
-    logger.trace("vertex " + vertex.getId() + ", superstep " + getSuperstep());
-    final int maxIter = getContext().getConfiguration().getInt(MAX_ITERATIONS, MAX_ITERATIONS_DEFAULT);
-    // Phases of the algorithm
-    if (getSuperstep() == 0) {
-      computeRowsColumns(vertex, messages);
-    } else if (getSuperstep() < maxIter) {
-      computeBMSIteration(vertex, messages);
-    } else if (getSuperstep() == maxIter) {
-      computeExemplars(vertex, messages);
-    } else {
-      computeClusters(vertex, messages);
+  public void initialize() throws InstantiationException, IllegalAccessException {
+    super.initialize();
+    registerPersistentAggregator("exemplars", ExemplarAggregator.class);
+  }
+
+  @Override
+  public void compute() {
+    super.compute();
+
+    final int maxIterations = getConf().getInt(MAX_ITERATIONS, MAX_ITERATIONS_DEFAULT);
+    if (getSuperstep() == maxIterations) {
+      setStage(AffinityPropagationStages.SELECT_EXEMPLARS);
+      logger.info("Maximum number of BMS iterations (" + maxIterations +
+          ") reached without converging.");
     }
   }
 
-  private void computeRowsColumns(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
-                                  Iterable<APMessage> messages) throws IOException {
-    final APVertexID id = vertex.getId();
-    aggregate("nRows", new LongWritable(id.row));
-    aggregate("nColumns", new LongWritable(id.column));
+  public static enum AffinityPropagationStages implements Stage {
+    INITIAL(InitialStage.class),
+    BINARY_MAX_SUM(BinaryMaxSumStage.class),
+    SELECT_EXEMPLARS(SelectExemplarsStage.class),
+    COMPUTE_CLUSTERS(ComputeClustersStage.class),
+    ;
+
+    private final Class<? extends StageComputation> clazz;
+
+    AffinityPropagationStages(Class<? extends StageComputation> clazz) {
+      this.clazz = clazz;
+    }
+
+    @Override
+    public Class<? extends StageComputation> getStageClass() {
+      return clazz;
+    }
   }
 
-  private void computeBMSIteration(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
-                                   Iterable<APMessage> messages) throws IOException {
-    final APVertexID id = vertex.getId();
-
-    LongWritable aggregatedRows = getAggregatedValue("nRows");
-    final long nRows = aggregatedRows.get();
-    LongWritable aggregatedColumns = getAggregatedValue("nRows");
-    final long nColumns = aggregatedColumns.get();
-    if (nRows != nColumns) {
-      throw new IllegalStateException("The input must form a square matrix, but we got " +
-          nRows + " rows and " + nColumns + "columns.");
-    }
-
-    if (getSuperstep() == 1) {
-      logger.trace("Number of rows: " + nRows);
-      logger.trace("Number of columns: " + nColumns);
-    }
-
-    // Build a factor of the required type
-    Factor<APVertexID> factor;
-    switch (id.type) {
-
-      case CONSISTENCY:
-        ConditionedDeactivationFactor<APVertexID> node2 = new ConditionedDeactivationFactor<APVertexID>();
-        node2.setExemplar(new APVertexID(APVertexType.SELECTOR, id.column, 0));
-        factor = node2;
-
-        for (int row = 1; row <= nRows; row++) {
-          APVertexID varId = new APVertexID(APVertexType.SELECTOR, row, 0);
-          node2.addNeighbor(varId);
-        }
-
-        break;
-
-      case SELECTOR:
-        final DoubleArrayListWritable value = vertex.getValue().weights;
-        SelectorFactor<APVertexID> selector = new SelectorFactor<APVertexID>();
-        WeightingFactor<APVertexID> weights = new WeightingFactor<APVertexID>(selector);
-        for (int column = 1; column <= nColumns; column++) {
-          APVertexID varId = new APVertexID(APVertexType.CONSISTENCY, 0, column);
-          weights.addNeighbor(varId);
-          weights.setPotential(varId, value.get(column - 1).get());
-        }
-        factor = weights;
-        break;
-
-      default:
-        throw new IllegalStateException("Unrecognized node type " + id.type);
-    }
-
-    // Initialize it with proper values
-    MessageRelayer collector = new MessageRelayer(vertex.getValue().lastMessages);
-    factor.setCommunicationAdapter(collector);
-    factor.setIdentity(id);
-    factor.setMaxOperator(MAX_OPERATOR);
-
-    // Receive messages and compute
-    for (APMessage message : messages) {
-      logger.trace(message);
-      factor.receive(message.value, message.from);
-    }
-    factor.run();
+  @Override
+  public TransitionElection getTransitionElection() {
+    return new UnanimityElection();
   }
 
-  private void computeExemplars(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
-                                Iterable<APMessage> messages) throws IOException {
-    final APVertexID id = vertex.getId();
-    // Exemplars are auto-elected among variables
-    if (id.type != APVertexType.CONSISTENCY) {
-      return;
+  @Override
+  public Stage[] getStages() {
+    return AffinityPropagationStages.values();
+  }
+
+  public static class InitialStage extends StageComputation
+      <AffinityPropagation.APVertexID, AffinityPropagation.APVertexValue,
+          NullWritable, AffinityPropagation.APMessage, AffinityPropagation.APMessage>{
+    @Override
+    public void compute(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
+                        Iterable<APMessage> messages) throws IOException {
+      voteToTransition(AffinityPropagationStages.BINARY_MAX_SUM);
+    }
+  }
+
+  public static class BinaryMaxSumStage extends StageComputation
+      <AffinityPropagation.APVertexID, AffinityPropagation.APVertexValue,
+          NullWritable, AffinityPropagation.APMessage, AffinityPropagation.APMessage>{
+
+    private long getNumRowsColumns() {
+      final long nVertices = getTotalNumVertices();
+      // Column vertices are created at superstep 2, and thus not counted until
+      // superstep 3.
+      if (getSuperstep() <= 2) {
+        logger.trace("Number of rows/columns: " + nVertices);
+        return nVertices;
+      }
+      return nVertices/2;
     }
 
-    // But only by those variables on the diagonal of the matrix
-    for (APMessage message : messages) {
-      if (message.from.row == id.column) {
-        double lastMessageValue = ((DoubleWritable) vertex.getValue().lastMessages.get(message.from)).get();
-        double belief = message.value + lastMessageValue;
-        if (belief >= 0) {
-          LongArrayListWritable exemplars = new LongArrayListWritable();
-          exemplars.add(new LongWritable(id.column));
-          aggregate("exemplars", exemplars);
-          logger.trace("Point " + id.column + " decides to become an exemplar with value " + belief + ".");
-        } else {
-          logger.trace("Point " + id.column + " does not want to be an exemplar with value " + belief + ".");
-        }
+    @Override
+    public void compute(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
+                        Iterable<APMessage> messages) throws IOException {
 
+      final APVertexID id = vertex.getId();
+      final long nRowsColumns = getNumRowsColumns();
+
+      // Build a factor of the required type
+      Factor<APVertexID> factor;
+      switch (id.type) {
+
+        case CONSISTENCY:
+          ConditionedDeactivationFactor<APVertexID> node2 = new ConditionedDeactivationFactor<APVertexID>();
+          node2.setExemplar(new APVertexID(APVertexType.SELECTOR, id.column, 0));
+          factor = node2;
+
+          for (int row = 1; row <= nRowsColumns; row++) {
+            APVertexID varId = new APVertexID(APVertexType.SELECTOR, row, 0);
+            logger.trace(id + " adds neighbor " + varId);
+            node2.addNeighbor(varId);
+          }
+          break;
+
+        case SELECTOR:
+          final DoubleArrayListWritable value = vertex.getValue().weights;
+          if (value.size() != nRowsColumns) {
+            throw new IllegalStateException("Non-square input matrix detected " +
+                "(rows=" + nRowsColumns + ", columns=" + value.size() + ")");
+          }
+
+          SelectorFactor<APVertexID> selector = new SelectorFactor<APVertexID>();
+          WeightingFactor<APVertexID> weights = new WeightingFactor<APVertexID>(selector);
+
+          for (int column = 1; column <= nRowsColumns; column++) {
+            APVertexID varId = new APVertexID(APVertexType.CONSISTENCY, 0, column);
+            weights.addNeighbor(varId);
+            weights.setPotential(varId, value.get(column - 1).get());
+          }
+          factor = weights;
+          break;
+
+        default:
+          throw new IllegalStateException("Unrecognized node type " + id.type);
+      }
+
+      // Initialize it with proper values
+      MessageRelay collector = new MessageRelay(vertex.getValue().lastMessages);
+      factor.setCommunicationAdapter(collector);
+      factor.setIdentity(id);
+      factor.setMaxOperator(MAX_OPERATOR);
+
+      // Receive messages and compute
+      for (APMessage message : messages) {
+        logger.trace(message);
+        factor.receive(message.value, message.from);
+      }
+      factor.run();
+
+      // TODO: Vote to transition?
+    }
+
+    public class MessageRelay implements CommunicationAdapter<APVertexID> {
+      private MapWritable lastMessages;
+      final float damping = getContext().getConfiguration().getFloat(DAMPING, DAMPING_DEFAULT);
+
+      public MessageRelay(MapWritable lastMessages) {
+        this.lastMessages = lastMessages;
+      }
+
+      @Override
+      public void send(double value, APVertexID sender, APVertexID recipient) {
+        if (lastMessages.containsKey(recipient)) {
+          final double lastMessage = ((DoubleWritable) lastMessages.get(recipient)).get();
+          value = damping * lastMessage + (1-damping) * value;
+        }
+        logger.trace(sender + " -> " + recipient + " : " + value);
+        BinaryMaxSumStage.this.sendMessage(recipient, new APMessage(sender, value));
+        lastMessages.put(recipient, new DoubleWritable(value));
       }
     }
 
-    vertex.voteToHalt();
   }
 
-  private void computeClusters(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
-                               Iterable<APMessage> messages) throws IOException {
-    APVertexID id = vertex.getId();
-    if (id.type != APVertexType.SELECTOR) {
-      return;
-    }
+  public static class SelectExemplarsStage extends StageComputation
+      <AffinityPropagation.APVertexID, AffinityPropagation.APVertexValue,
+          NullWritable, AffinityPropagation.APMessage, AffinityPropagation.APMessage>{
 
-    final LongArrayListWritable ls = getAggregatedValue("exemplars");
-    DoubleArrayListWritable values = vertex.getValue().weights;
-    double maxValue = Double.NEGATIVE_INFINITY;
-    long bestExemplar = -1;
-    for (LongWritable e : ls) {
-      final long exemplar = e.get();
+    public void compute(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
+                        Iterable<APMessage> messages) throws IOException {
+      voteToTransition(AffinityPropagationStages.COMPUTE_CLUSTERS);
+      final APVertexID id = vertex.getId();
 
-      if (exemplar == id.row) {
-        logger.trace("Point " + id.row + " is an exemplar.");
-        vertex.getValue().exemplar = new LongWritable(id.row);
-        vertex.voteToHalt();
+      // Exemplars are elected by the consistency factors (columns)
+      if (id.type != APVertexType.CONSISTENCY) {
         return;
       }
 
-      final double value = values.get((int) (exemplar - 1)).get();
-      if (value > maxValue) {
-        maxValue = value;
-        bestExemplar = exemplar;
-      }
-    }
+      // But only from the diagonal element
+      for (APMessage message : messages) {
+        if (message.from.row == id.column) {
+          double lastMessageValue = ((DoubleWritable) vertex.getValue().lastMessages.get(message.from)).get();
+          double belief = message.value + lastMessageValue;
+          if (belief >= 0) {
+            LongArrayListWritable exemplars = new LongArrayListWritable();
+            exemplars.add(new LongWritable(id.column));
+            aggregate("exemplars", exemplars);
+            logger.trace("Point " + id.column + " decides to become an exemplar with value " + belief + ".");
+          } else {
+            logger.trace("Point " + id.column + " does not want to be an exemplar with value " + belief + ".");
+          }
 
-    logger.trace("Point " + id.row + " decides to follow " + bestExemplar + ".");
-    vertex.getValue().exemplar = new LongWritable(bestExemplar);
-    vertex.voteToHalt();
+          break;
+        }
+      }
+
+      // And consistency factors are done at that point.
+      vertex.voteToHalt();
+    }
+  }
+
+  public static class ComputeClustersStage extends StageComputation
+      <AffinityPropagation.APVertexID, AffinityPropagation.APVertexValue,
+          NullWritable, AffinityPropagation.APMessage, AffinityPropagation.APMessage>{
+
+    public void compute(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
+                        Iterable<APMessage> messages) throws IOException {
+
+      APVertexID id = vertex.getId();
+      final LongArrayListWritable ls = getAggregatedValue("exemplars");
+      DoubleArrayListWritable values = vertex.getValue().weights;
+      double maxValue = Double.NEGATIVE_INFINITY;
+      long bestExemplar = -1;
+      for (LongWritable e : ls) {
+        final long exemplar = e.get();
+
+        if (exemplar == id.row) {
+          logger.trace("Point " + id.row + " is an exemplar.");
+          vertex.getValue().exemplar = new LongWritable(id.row);
+          vertex.voteToHalt();
+          return;
+        }
+
+        final double value = values.get((int) (exemplar - 1)).get();
+        if (value > maxValue) {
+          maxValue = value;
+          bestExemplar = exemplar;
+        }
+      }
+
+      logger.trace("Point " + id.row + " decides to follow " + bestExemplar + ".");
+      vertex.getValue().exemplar = new LongWritable(bestExemplar);
+      vertex.voteToHalt();
+    }
   }
 
   public static enum APVertexType {
@@ -360,39 +441,6 @@ public class AffinityPropagation
     public String toString() {
       return "APMessage{from=" + from + ", value=" + value + '}';
     }
-  }
-
-  public class MessageRelayer implements CommunicationAdapter<APVertexID> {
-    private MapWritable lastMessages;
-    final float damping = getContext().getConfiguration().getFloat(DAMPING, DAMPING_DEFAULT);
-
-    public MessageRelayer(MapWritable lastMessages) {
-      this.lastMessages = lastMessages;
-    }
-
-    @Override
-    public void send(double value, APVertexID sender, APVertexID recipient) {
-      if (lastMessages.containsKey(recipient)) {
-        final double lastMessage = ((DoubleWritable) lastMessages.get(recipient)).get();
-        value = damping * lastMessage + (1-damping) * value;
-      }
-      logger.trace(sender + " -> " + recipient + " : " + value);
-      AffinityPropagation.this.sendMessage(recipient, new APMessage(sender, value));
-      lastMessages.put(recipient, new DoubleWritable(value));
-    }
-  }
-
-  public static class MasterComputation extends DefaultMasterCompute {
-
-    @Override
-    public void initialize() throws InstantiationException, IllegalAccessException {
-      super.initialize();
-
-      registerPersistentAggregator("nRows", LongMaxAggregator.class);
-      registerPersistentAggregator("nColumns", LongMaxAggregator.class);
-      registerPersistentAggregator("exemplars", ExemplarAggregator.class);
-    }
-
   }
 
   public static class ExemplarAggregator extends BasicAggregator<LongArrayListWritable> {
