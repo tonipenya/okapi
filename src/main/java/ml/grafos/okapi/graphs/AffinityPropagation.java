@@ -15,6 +15,7 @@
  */
 package ml.grafos.okapi.graphs;
 
+import com.google.common.collect.ComparisonChain;
 import es.csic.iiia.bms.CommunicationAdapter;
 import es.csic.iiia.bms.Factor;
 import es.csic.iiia.bms.MaxOperator;
@@ -22,7 +23,8 @@ import es.csic.iiia.bms.Maximize;
 import es.csic.iiia.bms.factors.ConditionedDeactivationFactor;
 import es.csic.iiia.bms.factors.SelectorFactor;
 import es.csic.iiia.bms.factors.WeightingFactor;
-import ml.grafos.okapi.common.data.*;
+import ml.grafos.okapi.common.data.DoubleArrayListWritable;
+import ml.grafos.okapi.common.data.LongArrayListWritable;
 import ml.grafos.okapi.common.data.MapWritable;
 import ml.grafos.okapi.multistage.MultistageMasterCompute;
 import ml.grafos.okapi.multistage.Stage;
@@ -30,16 +32,14 @@ import ml.grafos.okapi.multistage.StageComputation;
 import ml.grafos.okapi.multistage.voting.TransitionElection;
 import ml.grafos.okapi.multistage.voting.UnanimityElection;
 import org.apache.giraph.aggregators.BasicAggregator;
-import org.apache.giraph.aggregators.LongMaxAggregator;
-import org.apache.giraph.graph.BasicComputation;
 import org.apache.giraph.graph.Vertex;
 import org.apache.giraph.io.formats.IdWithValueTextOutputFormat;
 import org.apache.giraph.io.formats.TextVertexValueInputFormat;
-import org.apache.giraph.master.DefaultMasterCompute;
 import org.apache.hadoop.io.*;
 import org.apache.hadoop.mapreduce.InputSplit;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -62,18 +62,25 @@ import java.util.regex.Pattern;
 public class AffinityPropagation extends MultistageMasterCompute {
   private static MaxOperator MAX_OPERATOR = new Maximize();
 
-  private static Logger logger = Logger.getLogger(AffinityPropagation.class);
+  private static Logger logger = LoggerFactory.getLogger(AffinityPropagation.class);
 
   /**
    * Maximum number of iterations.
    */
   public static final String MAX_ITERATIONS = "iterations";
   public static int MAX_ITERATIONS_DEFAULT = 15;
+
   /**
    * Damping factor.
    */
   public static final String DAMPING = "damping";
   public static float DAMPING_DEFAULT = 0.9f;
+
+  /**
+   * Epsilon factor, used to detect convergence.
+   */
+  public static final String EPSILON = "epsilon";
+  public static float EPSILON_DEFAULT = -1e5f;
 
   @Override
   public void initialize() throws InstantiationException, IllegalAccessException {
@@ -124,7 +131,7 @@ public class AffinityPropagation extends MultistageMasterCompute {
 
   public static class InitialStage extends StageComputation
       <AffinityPropagation.APVertexID, AffinityPropagation.APVertexValue,
-          NullWritable, AffinityPropagation.APMessage, AffinityPropagation.APMessage>{
+          NullWritable, AffinityPropagation.APMessage, AffinityPropagation.APMessage> {
     @Override
     public void compute(Vertex<APVertexID, APVertexValue, NullWritable> vertex,
                         Iterable<APMessage> messages) throws IOException {
@@ -134,14 +141,14 @@ public class AffinityPropagation extends MultistageMasterCompute {
 
   public static class BinaryMaxSumStage extends StageComputation
       <AffinityPropagation.APVertexID, AffinityPropagation.APVertexValue,
-          NullWritable, AffinityPropagation.APMessage, AffinityPropagation.APMessage>{
+          NullWritable, AffinityPropagation.APMessage, AffinityPropagation.APMessage> {
 
     private long getNumRowsColumns() {
       final long nVertices = getTotalNumVertices();
       // Column vertices are created at superstep 2, and thus not counted until
       // superstep 3.
       if (getSuperstep() <= 2) {
-        logger.trace("Number of rows/columns: " + nVertices);
+        logger.trace("Number of rows/columns: {}", nVertices);
         return nVertices;
       }
       return nVertices/2;
@@ -164,9 +171,9 @@ public class AffinityPropagation extends MultistageMasterCompute {
           factor = node2;
 
           for (int row = 1; row <= nRowsColumns; row++) {
-            APVertexID varId = new APVertexID(APVertexType.SELECTOR, row, 0);
-            logger.trace(id + " adds neighbor " + varId);
-            node2.addNeighbor(varId);
+            APVertexID rowId = new APVertexID(APVertexType.SELECTOR, row, 0);
+            logger.trace("{} adds neighbor {}", id, rowId);
+            node2.addNeighbor(rowId);
           }
           break;
 
@@ -200,17 +207,20 @@ public class AffinityPropagation extends MultistageMasterCompute {
 
       // Receive messages and compute
       for (APMessage message : messages) {
-        logger.trace(message);
         factor.receive(message.value, message.from);
       }
       factor.run();
 
-      // TODO: Vote to transition?
+      if (collector.converged) {
+        voteToTransition(AffinityPropagationStages.SELECT_EXEMPLARS);
+      }
     }
 
     public class MessageRelay implements CommunicationAdapter<APVertexID> {
       private MapWritable lastMessages;
-      final float damping = getContext().getConfiguration().getFloat(DAMPING, DAMPING_DEFAULT);
+      private final float damping = getConf().getFloat(DAMPING, DAMPING_DEFAULT);
+      private final float epsilon = getConf().getFloat(EPSILON, EPSILON_DEFAULT);
+      private boolean converged = true;
 
       public MessageRelay(MapWritable lastMessages) {
         this.lastMessages = lastMessages;
@@ -220,11 +230,16 @@ public class AffinityPropagation extends MultistageMasterCompute {
       public void send(double value, APVertexID sender, APVertexID recipient) {
         if (lastMessages.containsKey(recipient)) {
           final double lastMessage = ((DoubleWritable) lastMessages.get(recipient)).get();
+          if (Math.abs(lastMessage - value) < epsilon) {
+            return;
+          }
           value = damping * lastMessage + (1-damping) * value;
         }
-        logger.trace(sender + " -> " + recipient + " : " + value);
-        BinaryMaxSumStage.this.sendMessage(recipient, new APMessage(sender, value));
+
+        logger.trace("{} -> {} : {}", sender, recipient, value);
+        sendMessage(recipient, new APMessage(sender, value));
         lastMessages.put(recipient, new DoubleWritable(value));
+        converged = false;
       }
     }
 
@@ -247,15 +262,16 @@ public class AffinityPropagation extends MultistageMasterCompute {
       // But only from the diagonal element
       for (APMessage message : messages) {
         if (message.from.row == id.column) {
-          double lastMessageValue = ((DoubleWritable) vertex.getValue().lastMessages.get(message.from)).get();
+          double lastMessageValue = ((DoubleWritable) vertex.getValue().
+              lastMessages.get(message.from)).get();
           double belief = message.value + lastMessageValue;
           if (belief >= 0) {
             LongArrayListWritable exemplars = new LongArrayListWritable();
             exemplars.add(new LongWritable(id.column));
             aggregate("exemplars", exemplars);
-            logger.trace("Point " + id.column + " decides to become an exemplar with value " + belief + ".");
+            logger.trace("Point {} decides to become an exemplar with value {}.", id.column, belief);
           } else {
-            logger.trace("Point " + id.column + " does not want to be an exemplar with value " + belief + ".");
+            logger.trace("Point {} does not want to be an exemplar with value {}.", id.column, belief);
           }
 
           break;
@@ -283,7 +299,7 @@ public class AffinityPropagation extends MultistageMasterCompute {
         final long exemplar = e.get();
 
         if (exemplar == id.row) {
-          logger.trace("Point " + id.row + " is an exemplar.");
+          logger.trace("Point {} is an exemplar.", id.row);
           vertex.getValue().exemplar = new LongWritable(id.row);
           vertex.voteToHalt();
           return;
@@ -296,7 +312,7 @@ public class AffinityPropagation extends MultistageMasterCompute {
         }
       }
 
-      logger.trace("Point " + id.row + " decides to follow " + bestExemplar + ".");
+      logger.trace("Point {} decides to follow {}.", id.row, bestExemplar);
       vertex.getValue().exemplar = new LongWritable(bestExemplar);
       vertex.voteToHalt();
     }
@@ -337,24 +353,12 @@ public class AffinityPropagation extends MultistageMasterCompute {
     }
 
     @Override
-    public int compareTo(APVertexID o) {
-      if (o == null) {
-        return 1;
-      }
-
-      if (!type.equals(o.type)) {
-        return type.compareTo(o.type);
-      }
-
-      if (row != o.row) {
-        return Long.compare(row, o.row);
-      }
-
-      if (column != o.column) {
-        return Long.compare(column, o.column);
-      }
-
-      return 0;
+    public int compareTo(APVertexID that) {
+      return ComparisonChain.start()
+          .compare(this.type, that.type)
+          .compare(this.row, that.row)
+          .compare(this.column, that.column)
+          .result();
     }
 
     @Override
@@ -363,12 +367,9 @@ public class AffinityPropagation extends MultistageMasterCompute {
       if (o == null || getClass() != o.getClass()) return false;
 
       APVertexID that = (APVertexID) o;
-
-      if (column != that.column) return false;
-      if (row != that.row) return false;
-      if (type != that.type) return false;
-
-      return true;
+      return column == that.column
+          && row == that.row
+          && type == that.type;
     }
 
     @Override
@@ -571,11 +572,8 @@ public class AffinityPropagation extends MultistageMasterCompute {
           return null;
         }
 
-        StringBuilder str = new StringBuilder();
-        str.append(vertex.getId().row);
-        str.append(delimiter);
-        str.append(Long.toString(vertex.getValue().exemplar.get()));
-        return new Text(str.toString());
+        return new Text(String.valueOf(vertex.getId().row)
+            + delimiter + Long.toString(vertex.getValue().exemplar.get()));
       }
     }
   }
