@@ -48,12 +48,12 @@ import java.util.regex.Pattern;
 
 /**
  * Affinity Propagation is a clustering algorithm.
- * <p/>
- * The number of clusters is not received as an input, but computed by the
+ *
+ * <p>The number of clusters is not received as an input, but computed by the
  * algorithm according to the distances between points and the preference
  * of each node to be an <i>exemplar</i> (the "leader" of a cluster).
- * <p/>
- * You can find a detailed description of the algorithm in the affinity propagation
+ *
+ * <p>You can find a detailed description of the algorithm in the affinity propagation
  * <a href="http://genes.toronto.edu/index.php?q=affinity%20propagation">website</a>.
  *
  * @author Marc Pujol-Gonzalez <mpujol@iiia.csic.es>
@@ -165,19 +165,19 @@ public class AffinityPropagation extends MultistageMasterCompute {
       Factor<APVertexID> factor;
       switch (id.type) {
 
-        case CONSISTENCY:
+        case COLUMN:
           ConditionedDeactivationFactor<APVertexID> node2 = new ConditionedDeactivationFactor<APVertexID>();
-          node2.setExemplar(new APVertexID(APVertexType.SELECTOR, id.column, 0));
+          node2.setExemplar(new APVertexID(APVertexType.ROW, id.index));
           factor = node2;
 
           for (int row = 1; row <= nRowsColumns; row++) {
-            APVertexID rowId = new APVertexID(APVertexType.SELECTOR, row, 0);
+            APVertexID rowId = new APVertexID(APVertexType.ROW, row);
             logger.trace("{} adds neighbor {}", id, rowId);
             node2.addNeighbor(rowId);
           }
           break;
 
-        case SELECTOR:
+        case ROW:
           final DoubleArrayListWritable value = vertex.getValue().weights;
           if (value.size() != nRowsColumns) {
             throw new IllegalStateException("Non-square input matrix detected " +
@@ -188,7 +188,7 @@ public class AffinityPropagation extends MultistageMasterCompute {
           WeightingFactor<APVertexID> weights = new WeightingFactor<APVertexID>(selector);
 
           for (int column = 1; column <= nRowsColumns; column++) {
-            APVertexID varId = new APVertexID(APVertexType.CONSISTENCY, 0, column);
+            APVertexID varId = new APVertexID(APVertexType.COLUMN, column);
             weights.addNeighbor(varId);
             weights.setPotential(varId, value.get(column - 1).get());
           }
@@ -255,23 +255,23 @@ public class AffinityPropagation extends MultistageMasterCompute {
       final APVertexID id = vertex.getId();
 
       // Exemplars are elected by the consistency factors (columns)
-      if (id.type != APVertexType.CONSISTENCY) {
+      if (id.type != APVertexType.COLUMN) {
         return;
       }
 
       // But only from the diagonal element
       for (APMessage message : messages) {
-        if (message.from.row == id.column) {
+        if (message.from.index == id.index) {
           double lastMessageValue = ((DoubleWritable) vertex.getValue().
               lastMessages.get(message.from)).get();
           double belief = message.value + lastMessageValue;
           if (belief >= 0) {
             LongArrayListWritable exemplars = new LongArrayListWritable();
-            exemplars.add(new LongWritable(id.column));
+            exemplars.add(new LongWritable(id.index));
             aggregate("exemplars", exemplars);
-            logger.trace("Point {} decides to become an exemplar with value {}.", id.column, belief);
+            logger.trace("Point {} decides to become an exemplar with value {}.", id.index, belief);
           } else {
-            logger.trace("Point {} does not want to be an exemplar with value {}.", id.column, belief);
+            logger.trace("Point {} does not want to be an exemplar with value {}.", id.index, belief);
           }
 
           break;
@@ -298,9 +298,9 @@ public class AffinityPropagation extends MultistageMasterCompute {
       for (LongWritable e : ls) {
         final long exemplar = e.get();
 
-        if (exemplar == id.row) {
-          logger.trace("Point {} is an exemplar.", id.row);
-          vertex.getValue().exemplar = new LongWritable(id.row);
+        if (exemplar == id.index) {
+          logger.trace("Point {} is an exemplar.", id.index);
+          vertex.getValue().exemplar = new LongWritable(id.index);
           vertex.voteToHalt();
           return;
         }
@@ -312,52 +312,47 @@ public class AffinityPropagation extends MultistageMasterCompute {
         }
       }
 
-      logger.trace("Point {} decides to follow {}.", id.row, bestExemplar);
+      logger.trace("Point {} decides to follow {}.", id.index, bestExemplar);
       vertex.getValue().exemplar = new LongWritable(bestExemplar);
       vertex.voteToHalt();
     }
   }
 
   public static enum APVertexType {
-    CONSISTENCY, SELECTOR
+    COLUMN, ROW
   }
 
   public static class APVertexID implements WritableComparable<APVertexID> {
 
-    public APVertexType type = APVertexType.SELECTOR;
-    public long row = 0;
-    public long column = 0;
+    public APVertexType type = APVertexType.ROW;
+    public long index = 0;
 
     public APVertexID() {
     }
 
-    public APVertexID(APVertexType type, long row, long column) {
+    public APVertexID(APVertexType type, long index) {
       this.type = type;
-      this.row = row;
-      this.column = column;
+      this.index = index;
     }
 
     @Override
     public void write(DataOutput dataOutput) throws IOException {
       dataOutput.writeInt(type.ordinal());
-      dataOutput.writeLong(row);
-      dataOutput.writeLong(column);
+      dataOutput.writeLong(index);
     }
 
     @Override
     public void readFields(DataInput dataInput) throws IOException {
       final int index = dataInput.readInt();
       type = APVertexType.values()[index];
-      row = dataInput.readLong();
-      column = dataInput.readLong();
+      this.index = dataInput.readLong();
     }
 
     @Override
     public int compareTo(APVertexID that) {
       return ComparisonChain.start()
           .compare(this.type, that.type)
-          .compare(this.row, that.row)
-          .compare(this.column, that.column)
+          .compare(this.index, that.index)
           .result();
     }
 
@@ -367,22 +362,19 @@ public class AffinityPropagation extends MultistageMasterCompute {
       if (o == null || getClass() != o.getClass()) return false;
 
       APVertexID that = (APVertexID) o;
-      return column == that.column
-          && row == that.row
-          && type == that.type;
+      return index == that.index && type == that.type;
     }
 
     @Override
     public int hashCode() {
       int result = type.hashCode();
-      result = 31 * result + (int) (row ^ (row >>> 32));
-      result = 31 * result + (int) (column ^ (column >>> 32));
+      result = 31 * result + (int) (index ^ (index >>> 32));
       return result;
     }
 
     @Override
     public String toString() {
-      return "(" + type + ", " + row + ", " + column + ")";
+      return "(" + type + ", " + index + ")";
     }
   }
 
@@ -497,8 +489,8 @@ public class AffinityPropagation extends MultistageMasterCompute {
 
       @Override
       protected APVertexID getId(String[] line) throws IOException {
-        return new APVertexID(APVertexType.SELECTOR,
-            Long.valueOf(line[0]), 0);
+        return new APVertexID(APVertexType.ROW,
+            Long.valueOf(line[0]));
       }
 
       @Override
@@ -568,11 +560,11 @@ public class AffinityPropagation extends MultistageMasterCompute {
           APVertexValue, NullWritable> vertex)
           throws IOException {
 
-        if (vertex.getId().type != APVertexType.SELECTOR) {
+        if (vertex.getId().type != APVertexType.ROW) {
           return null;
         }
 
-        return new Text(String.valueOf(vertex.getId().row)
+        return new Text(String.valueOf(vertex.getId().index)
             + delimiter + Long.toString(vertex.getValue().exemplar.get()));
       }
     }
