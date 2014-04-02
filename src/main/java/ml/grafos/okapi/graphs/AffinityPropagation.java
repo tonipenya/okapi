@@ -230,10 +230,11 @@ public class AffinityPropagation extends MultistageMasterCompute {
       public void send(double value, APVertexID sender, APVertexID recipient) {
         if (lastMessages.containsKey(recipient)) {
           final double lastMessage = ((DoubleWritable) lastMessages.get(recipient)).get();
+          value = damping * lastMessage + (1-damping) * value;
+
           if (Math.abs(lastMessage - value) < epsilon) {
             return;
           }
-          value = damping * lastMessage + (1-damping) * value;
         }
 
         logger.trace("{} -> {} : {}", sender, recipient, value);
